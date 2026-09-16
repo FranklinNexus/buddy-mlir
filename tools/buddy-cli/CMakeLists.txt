@@ -8,6 +8,7 @@ target_compile_features(buddy-cli PRIVATE cxx_std_17)
 target_link_libraries(buddy-cli PRIVATE
   buddy_runtime_core
   buddy_runtime_llm
+  CLI11
   ${CMAKE_DL_LIBS}
 )
 
