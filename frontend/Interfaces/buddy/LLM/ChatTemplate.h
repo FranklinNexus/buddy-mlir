@@ -25,9 +25,11 @@
 #ifndef FRONTEND_INTERFACES_BUDDY_LLM_CHATTEMPLATE
 #define FRONTEND_INTERFACES_BUDDY_LLM_CHATTEMPLATE
 
-#include "llvm/Support/JSON.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/raw_ostream.h"
+#include <jsoncons/json.hpp>
+
+#include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -45,16 +47,20 @@ public:
   /// Load a chat template from a JSON config file.
   /// Throws std::runtime_error on failure.
   static ChatTemplate fromFile(const std::string &path) {
-    auto bufOrErr = llvm::MemoryBuffer::getFile(path);
-    if (!bufOrErr) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
       throw std::runtime_error("Failed to open chat template file: " + path);
-    }
-    auto parsed = llvm::json::parse((*bufOrErr)->getBuffer());
-    if (!parsed) {
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+
+    jsoncons::json root;
+    try {
+      root = jsoncons::json::parse(text);
+    } catch (const std::exception &e) {
       throw std::runtime_error("Failed to parse chat template JSON: " +
-                               llvm::toString(parsed.takeError()));
+                               std::string(e.what()));
     }
-    return fromJSON(*parsed);
+    return fromJSON(root);
   }
 
   /// Apply the template to a message list, producing the full prompt string.
@@ -118,57 +124,52 @@ private:
   bool addGenerationPrompt_ = true;
   bool systemInFirstUser_ = false;
 
-  static std::string getStr(const llvm::json::Object &obj, llvm::StringRef key,
-                            llvm::StringRef defaultVal = "") {
-    if (auto v = obj.getString(key))
-      return v->str();
-    return defaultVal.str();
-  }
-
-  static bool getBool(const llvm::json::Object &obj, llvm::StringRef key,
-                      bool defaultVal = false) {
-    if (auto v = obj.getBoolean(key))
-      return *v;
+  static std::string getStr(const jsoncons::json &obj, const std::string &key,
+                            const std::string &defaultVal = "") {
+    if (obj.contains(key) && obj[key].is_string())
+      return obj[key].as<std::string>();
     return defaultVal;
   }
 
-  static ChatTemplate fromJSON(const llvm::json::Value &root) {
+  static bool getBool(const jsoncons::json &obj, const std::string &key,
+                      bool defaultVal = false) {
+    if (obj.contains(key) && obj[key].is_bool())
+      return obj[key].as<bool>();
+    return defaultVal;
+  }
+
+  static ChatTemplate fromJSON(const jsoncons::json &root) {
     ChatTemplate tmpl;
-    auto *obj = root.getAsObject();
-    if (!obj) {
+    if (!root.is_object()) {
       throw std::runtime_error("Chat template JSON root must be an object");
     }
 
-    tmpl.bosToken_ = getStr(*obj, "bos_token");
-    tmpl.eosToken_ = getStr(*obj, "eos_token");
-    tmpl.roleSuffix_ = getStr(*obj, "role_suffix");
-    tmpl.turnSuffix_ = getStr(*obj, "turn_suffix");
-    tmpl.addBos_ = getBool(*obj, "add_bos", true);
-    tmpl.addGenerationPrompt_ = getBool(*obj, "add_generation_prompt", true);
-    tmpl.systemInFirstUser_ = getBool(*obj, "system_in_first_user", false);
+    tmpl.bosToken_ = getStr(root, "bos_token");
+    tmpl.eosToken_ = getStr(root, "eos_token");
+    tmpl.roleSuffix_ = getStr(root, "role_suffix");
+    tmpl.turnSuffix_ = getStr(root, "turn_suffix");
+    tmpl.addBos_ = getBool(root, "add_bos", true);
+    tmpl.addGenerationPrompt_ = getBool(root, "add_generation_prompt", true);
+    tmpl.systemInFirstUser_ = getBool(root, "system_in_first_user", false);
 
-    if (auto *roles = obj->getObject("roles")) {
-      for (const auto &kv : *roles) {
-        if (auto str = kv.second.getAsString()) {
-          tmpl.rolePrefixes_[kv.first.str()] = str->str();
-        }
+    if (root.contains("roles") && root["roles"].is_object()) {
+      for (const auto &member : root["roles"].object_range()) {
+        if (member.value().is_string())
+          tmpl.rolePrefixes_[std::string(member.key())] =
+              member.value().as<std::string>();
       }
     }
 
-    if (auto *arr = obj->getArray("stop_tokens")) {
-      for (const auto &v : *arr) {
-        if (auto s = v.getAsString()) {
-          tmpl.stopTokens_.push_back(s->str());
-        }
-      }
+    if (root.contains("stop_tokens") && root["stop_tokens"].is_array()) {
+      for (const auto &v : root["stop_tokens"].array_range())
+        if (v.is_string())
+          tmpl.stopTokens_.push_back(v.as<std::string>());
     }
 
-    if (auto *arr = obj->getArray("stop_token_ids")) {
-      for (const auto &v : *arr) {
-        if (auto n = v.getAsInteger()) {
-          tmpl.stopTokenIds_.push_back(static_cast<int>(*n));
-        }
-      }
+    if (root.contains("stop_token_ids") && root["stop_token_ids"].is_array()) {
+      for (const auto &v : root["stop_token_ids"].array_range())
+        if (v.is_number())
+          tmpl.stopTokenIds_.push_back(static_cast<int>(v.as<int64_t>()));
     }
 
     return tmpl;
