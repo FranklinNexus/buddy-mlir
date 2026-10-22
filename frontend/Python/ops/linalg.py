@@ -7215,12 +7215,89 @@ def avg_pool3d_op(
     return result
 
 
+def _topk_small_row(source, values, indices, coordinates, k, better):
+    """Maintain sorted top-k slots while scanning a rank-2 f32 row once."""
+    dim = 1
+    index_type = ir.IndexType.get()
+    i64 = ir.IntegerType.get_signless(64)
+    seen = arith.ConstantOp(ir.IntegerType.get_signless(1), 1).result
+    c1 = arith.ConstantOp(index_type, 1).result
+    count = arith.ConstantOp(index_type, k).result
+    limit = arith.ConstantOp(
+        index_type, ir.RankedTensorType(source.type).shape[1]
+    ).result
+    positions = [arith.ConstantOp(index_type, j).result for j in range(k)]
+
+    def address(j):
+        at = list(coordinates)
+        at[dim] = positions[j]
+        return at
+
+    def insert(value, index, length):
+        # Displaced ties must retain the earlier original index.
+        for j in range(length):
+            at = address(j)
+            old_value = memref.LoadOp(values, at).result
+            old_index = memref.LoadOp(indices, at).result
+            ahead = better(value, old_value)
+            behind = better(old_value, value)
+            tied = arith.XOrIOp(arith.OrIOp(ahead, behind).result, seen).result
+            earlier = arith.CmpIOp(
+                arith.CmpIPredicate.slt, index, old_index
+            ).result
+            choose = arith.OrIOp(
+                ahead, arith.AndIOp(tied, earlier).result
+            ).result
+            new_value = arith.SelectOp(choose, value, old_value).result
+            new_index = arith.SelectOp(choose, index, old_index).result
+            value = arith.SelectOp(choose, old_value, value).result
+            index = arith.SelectOp(choose, old_index, index).result
+            memref.StoreOp(new_value, values, at)
+            memref.StoreOp(new_index, indices, at)
+        return value, index
+
+    # Initialize exactly k slots before any load from those slots.
+    for j in range(k):
+        value = tensor.ExtractOp(source, address(j)).result
+        index = arith.ConstantOp(i64, j).result
+        value, index = insert(value, index, j)
+        memref.StoreOp(value, values, address(j))
+        memref.StoreOp(index, indices, address(j))
+
+    scan = scf.ForOp(count, limit, c1)
+    with ir.InsertionPoint(scan.body):
+        at = list(coordinates)
+        at[dim] = scan.induction_variable
+        value = tensor.ExtractOp(source, at).result
+        worst = memref.LoadOp(values, address(k - 1)).result
+        update = scf.IfOp(better(value, worst), has_else=False)
+        with ir.InsertionPoint(update.then_block):
+            index = arith.IndexCastOp(i64, scan.induction_variable).result
+            first = memref.LoadOp(values, address(0)).result
+            new_first = scf.IfOp(better(value, first), has_else=True)
+            with ir.InsertionPoint(new_first.then_block):
+                for j in range(k - 1, 0, -1):
+                    old_value = memref.LoadOp(values, address(j - 1)).result
+                    old_index = memref.LoadOp(indices, address(j - 1)).result
+                    memref.StoreOp(old_value, values, address(j))
+                    memref.StoreOp(old_index, indices, address(j))
+                memref.StoreOp(value, values, address(0))
+                memref.StoreOp(index, indices, address(0))
+                scf.YieldOp([])
+            with ir.InsertionPoint(new_first.else_block):
+                insert(value, index, k)
+                scf.YieldOp([])
+            scf.YieldOp([])
+        scf.YieldOp([])
+
+
 def topk_op(node: TopkOp, symbol_table):
     """Select distinct indices along a static axis; NaNs rank above numbers.
 
     Results are sorted even when sorted=False, which permits either order.
     Equal values retain their first unused index; PyTorch does not promise a
-    particular index order for ties. Work is proportional to axis length * k.
+    particular index order for ties. Small k on rank-2 f32 rows uses a single
+    scan with bounded insertion; other inputs retain repeated selection.
     """
     source = symbol_table[(str(node.args[0]), 0)]
     source_type = ir.RankedTensorType(source.type)
@@ -7274,8 +7351,15 @@ def topk_op(node: TopkOp, symbol_table):
         flag_type = ir.IntegerType.get_signless(1)
         seen = arith.ConstantOp(flag_type, 1).result
         unseen = arith.ConstantOp(flag_type, 0).result
-        used = memref.AllocOp(ir.MemRefType.get(shape, flag_type), [], [])
-        linalg.fill(unseen, outs=[used.result])
+        small_k = (
+            rank == 2
+            and dim == 1
+            and 2 <= k <= 8
+            and isinstance(dtype, ir.F32Type)
+        )
+        if not small_k:
+            used = memref.AllocOp(ir.MemRefType.get(shape, flag_type), [], [])
+            linalg.fill(unseen, outs=[used.result])
         initial = arith.ConstantOp(dtype, 0.0 if is_float else 0).result
 
         def better(value, best):
@@ -7301,6 +7385,9 @@ def topk_op(node: TopkOp, symbol_table):
             return arith.OrIOp(ordered, nan_wins).result
 
         def visit_axis(coordinates):
+            if small_k:
+                _topk_small_row(source, values, indices, coordinates, k, better)
+                return
             select_loop = scf.ForOp(c0, count, c1)
             with ir.InsertionPoint(select_loop.body):
                 search = scf.ForOp(c0, limit, c1, [initial, missing])
