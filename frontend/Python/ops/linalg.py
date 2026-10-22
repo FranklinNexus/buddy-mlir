@@ -3230,25 +3230,31 @@ def _cumulative_tensor(
             build_outer_loops(dim_idx + 1)
             scf.YieldOp(loop.inner_iter_args)
 
+    # Float Cumprod keeps the original scan: folding its initial 1*x can
+    # change signaling NaNs into an unquieted first output.
     if (
-        op_kind == "cumsum"
+        (
+            op_kind == "cumsum"
+            or (op_kind == "cumprod" and str(mlir_dtype) == "i64")
+        )
         and rank == 2
         and dim == 0
         and input_shape[0] > 0
         and input_shape[1] >= 64
         and (str(mlir_dtype) in ("f32", "i64"))
     ):
+        combine = (
+            (arith.AddFOp if is_float else arith.AddIOp)
+            if op_kind == "cumsum"
+            else arith.MulIOp
+        )
         # Traverse adjacent columns together without reassociating each scan.
-        # Keep the initial addition: copying row zero changes signed-zero results.
+        # Keep the initial operation, including signed-zero and NaN semantics.
         first = scf.ForOp(c0.result, bounds[1], c1.result)
         with ir.InsertionPoint(first.body):
             j = first.induction_variable
             value = memref.LoadOp(input_memref, [c0.result, j]).result
-            value = (
-                arith.AddFOp(init_val.result, value)
-                if is_float
-                else arith.AddIOp(init_val.result, value)
-            ).result
+            value = combine(init_val.result, value).result
             memref.StoreOp(value, output_memref, [c0.result, j])
             scf.YieldOp([])
         rows = scf.ForOp(c1.result, bounds[0], c1.result)
@@ -3260,9 +3266,7 @@ def _cumulative_tensor(
                 j = cols.induction_variable
                 a = memref.LoadOp(output_memref, [prev, j]).result
                 b = memref.LoadOp(input_memref, [i, j]).result
-                value = (
-                    arith.AddFOp(a, b) if is_float else arith.AddIOp(a, b)
-                ).result
+                value = combine(a, b).result
                 memref.StoreOp(value, output_memref, [i, j])
                 scf.YieldOp([])
             scf.YieldOp([])

@@ -21,6 +21,23 @@ for label, width, dtype in (
     print(label)
     print(graph._imported_module)
 
+
+def product(x):
+    return torch.cumprod(x, 0)
+
+
+compiler = DynamoCompiler(primary_registry=linalg.ops_registry)
+graph = compiler.importer(product, torch.ones(65, 64, dtype=torch.int64))[0]
+graph.lower_to_top_level_ir()
+print("PRODUCT")
+print(graph._imported_module)
+
+compiler = DynamoCompiler(primary_registry=linalg.ops_registry)
+graph = compiler.importer(product, torch.ones(65, 64))[0]
+graph.lower_to_top_level_ir()
+print("FLOAT_PRODUCT")
+print(graph._imported_module)
+
 # CHECK-LABEL: CONTIGUOUS
 # CHECK: arith.subi
 # CHECK: memref.load
@@ -29,4 +46,13 @@ for label, width, dtype in (
 # CHECK-LABEL: SHORT
 # CHECK: iter_args
 # CHECK-LABEL: F64
+# CHECK: iter_args
+
+# CHECK-LABEL: PRODUCT
+# CHECK: arith.subi
+# CHECK: memref.load
+# CHECK: memref.load
+# CHECK: arith.muli
+
+# CHECK-LABEL: FLOAT_PRODUCT
 # CHECK: iter_args
