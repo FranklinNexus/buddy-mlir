@@ -1,4 +1,4 @@
-"""Benchmark native Cumsum with output allocation and release included."""
+"""Benchmark native cumulative scans with output allocation and release included."""
 
 import argparse
 import ctypes
@@ -14,12 +14,15 @@ from buddy_mlir import runtime as rt
 
 
 class Scan(torch.nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, operation):
         super().__init__()
         self.dim = dim
+        self.operation = operation
 
     def forward(self, x):
-        return torch.cumsum(x, self.dim)
+        return (torch.cumprod if self.operation == "cumprod" else torch.cumsum)(
+            x, self.dim
+        )
 
 
 def main():
@@ -28,6 +31,9 @@ def main():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--dtype", choices=("f32", "i64"), default="f32")
     parser.add_argument("--dim", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--operation", choices=("cumsum", "cumprod"), default="cumsum"
+    )
     args = parser.parse_args()
     if min(args.rows, args.width) < 1:
         parser.error("rows and width must be positive")
@@ -36,7 +42,10 @@ def main():
     x = torch.randint(-8, 9, (args.rows, args.width)).to(
         torch.float32 if args.dtype == "f32" else torch.int64
     )
-    model = Scan(args.dim)
+    if args.operation == "cumprod":
+        torch.manual_seed(0)
+        x = (torch.randint(0, 2, (args.rows, args.width)) * 2 - 1).to(x.dtype)
+    model = Scan(args.dim, args.operation)
     ep = torch.export.export(model, (x,), strict=True)
     compiler = DynamoCompiler(
         primary_registry=tosa.ops_registry, enable_external_calls=False
@@ -87,6 +96,7 @@ def main():
                 "shape": list(x.shape),
                 "dtype": args.dtype,
                 "dim": args.dim,
+                "operation": args.operation,
                 "seed": 0,
                 "torch_version": torch.__version__,
                 "threads": 1,

@@ -1,15 +1,17 @@
-# Cumsum CPU traversal
+# Cumulative CPU traversal
 
-For static rank-two f32/i64 inputs scanned along axis zero with at least
-64 columns and a nonempty first axis, visit consecutive columns together.
-Each column still starts with zero plus its first value and accumulates in
+For static rank-two Cumsum (f32/i64) and Cumprod (i64) scans along axis zero
+with at least 64 columns and a nonempty first axis, visit consecutive
+columns together.
+Cumsum starts with zero plus its first value; integer Cumprod starts with one times
+its first value. Each column accumulates in
 increasing row order. The previous output row supplies the accumulator;
 there is no scratch allocation or reassociation. Other shapes, axes and
 output types retain the existing implementation.
 
 This targets strided loads and stores in the original column-at-a-time
 loop. It adds a load of the previous output row, which is usually cache
-resident. The initial addition is retained for signed-zero semantics.
+resident. The initial operation is retained for signed-zero and NaN semantics.
 
 ## Measurement
 
@@ -48,3 +50,28 @@ also cover NaNs, infinities, signed zeros, cancellation and integer overflow.
 ninja -C build check-buddy
 ninja -C build check-buddy-server
 ```
+
+## Integer Cumprod
+
+The same traversal applies to i64 Cumprod, preserving multiplication order
+within each column. Shape and axis guards above still apply. Float Cumprod
+keeps the original scan: folding the first multiplication by one in the
+experimental path left signaling NaNs unquieted in the first output row.
+That candidate was rejected despite faster finite-value benchmarks.
+
+Use the same benchmark script on baseline afdad3b and the candidate:
+
+```sh
+python scripts/benchmark_cumsum.py --operation cumprod --rows 1024 --width 1024 --dtype i64
+```
+
+Timing inputs are seeded random +1/-1 values to avoid overflow and
+underflow. Tests separately cover integer limits and modular overflow,
+floating-point special values, short/empty axes and fallback types.
+The original Cumsum traversal is unchanged; IR comparisons verify this.
+
+With the same CPU, LLVM build and timing protocol above, two rounds for
+1024-by-1024 i64 Cumprod measured 4.093/3.746 ms on the baseline and
+0.309/0.303 ms with contiguous traversal (about 12-13x). Float Cumprod
+retains identical lowered IR and is not claimed as an optimization.
+These measurements apply only to the tested CPU workloads.
