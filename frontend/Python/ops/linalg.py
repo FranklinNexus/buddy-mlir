@@ -3716,8 +3716,121 @@ def gcd_op(
     ).result
 
 
+def _sort_merge_row(
+    output,
+    indices,
+    scratch,
+    scratch_indices,
+    coordinates,
+    dim,
+    size,
+    descending,
+    is_float,
+):
+    """Merge one static row stably, reusing axis-sized scratch buffers."""
+    index_type = ir.IndexType.get()
+    zero = arith.ConstantOp(index_type, 0).result
+    one = arith.ConstantOp(index_type, 1).result
+    limit = arith.ConstantOp(index_type, size).result
+    last = arith.ConstantOp(index_type, size - 1).result
+    true = arith.ConstantOp(ir.IntegerType.get_signless(1), 1).result
+
+    def address(i):
+        at = list(coordinates)
+        at[dim] = i
+        return at
+
+    def right_first(a, b):
+        if not is_float:
+            return arith.CmpIOp(
+                arith.CmpIPredicate.slt
+                if descending
+                else arith.CmpIPredicate.sgt,
+                a,
+                b,
+            ).result
+        ordered = arith.CmpFOp(
+            arith.CmpFPredicate.OLT if descending else arith.CmpFPredicate.OGT,
+            a,
+            b,
+        ).result
+        a_nan = arith.CmpFOp(arith.CmpFPredicate.UNO, a, a).result
+        b_nan = arith.CmpFOp(arith.CmpFPredicate.UNO, b, b).result
+        nan_first = arith.AndIOp(
+            b_nan if descending else a_nan,
+            arith.XOrIOp(a_nan if descending else b_nan, true).result,
+        ).result
+        return arith.OrIOp(ordered, nan_first).result
+
+    width = 1
+    while width < size:
+        half = arith.ConstantOp(index_type, width).result
+        step = arith.ConstantOp(index_type, 2 * width).result
+        pairs = scf.ForOp(zero, limit, step)
+        with ir.InsertionPoint(pairs.body):
+            base = pairs.induction_variable
+            middle = arith.MinUIOp(
+                arith.AddIOp(base, half).result, limit
+            ).result
+            end = arith.MinUIOp(arith.AddIOp(base, step).result, limit).result
+            merge = scf.ForOp(base, end, one, [base, middle])
+            with ir.InsertionPoint(merge.body):
+                left, right = merge.inner_iter_args
+                # Clamp exhausted cursors before eager loads; never read past the row.
+                left_at = address(arith.MinUIOp(left, last).result)
+                right_at = address(arith.MinUIOp(right, last).result)
+                a = memref.LoadOp(output, left_at).result
+                b = memref.LoadOp(output, right_at).result
+                ai = memref.LoadOp(indices, left_at).result
+                bi = memref.LoadOp(indices, right_at).result
+                left_valid = arith.CmpIOp(
+                    arith.CmpIPredicate.ult, left, middle
+                ).result
+                right_done = arith.CmpIOp(
+                    arith.CmpIPredicate.uge, right, end
+                ).result
+                take_left = arith.AndIOp(
+                    left_valid,
+                    arith.OrIOp(
+                        right_done, arith.XOrIOp(right_first(a, b), true).result
+                    ).result,
+                ).result
+                memref.StoreOp(
+                    arith.SelectOp(take_left, a, b).result,
+                    scratch,
+                    [merge.induction_variable],
+                )
+                memref.StoreOp(
+                    arith.SelectOp(take_left, ai, bi).result,
+                    scratch_indices,
+                    [merge.induction_variable],
+                )
+                scf.YieldOp(
+                    [
+                        arith.SelectOp(
+                            take_left, arith.AddIOp(left, one).result, left
+                        ).result,
+                        arith.SelectOp(
+                            take_left, right, arith.AddIOp(right, one).result
+                        ).result,
+                    ]
+                )
+            scf.YieldOp([])
+        copy = scf.ForOp(zero, limit, one)
+        with ir.InsertionPoint(copy.body):
+            i = copy.induction_variable
+            memref.StoreOp(
+                memref.LoadOp(scratch, [i]).result, output, address(i)
+            )
+            memref.StoreOp(
+                memref.LoadOp(scratch_indices, [i]).result, indices, address(i)
+            )
+            scf.YieldOp([])
+        width *= 2
+
+
 def sort_op(node, symbol_table):
-    """Stable adjacent-swap sort along a static tensor dimension."""
+    """Stable sort with a merge path for long f32/i64 axes."""
     value = symbol_table[(str(node.args[0]), 0)]
     value_type = ir.RankedTensorType(value.type)
     shape = list(value_type.shape)
@@ -3771,7 +3884,32 @@ def sort_op(node, symbol_table):
 
     loops(list(range(rank)), [zero] * rank, initialize)
 
+    use_merge = (
+        rank > 0
+        and shape[dim] >= 512
+        and (isinstance(dtype, ir.F32Type) or dtype == i64)
+    )
+    if use_merge:
+        # One pair reused across rows; ownership-based deallocation frees it.
+        scratch = memref.AllocOp(ir.MemRefType.get([shape[dim]], dtype), [], [])
+        scratch_indices = memref.AllocOp(
+            ir.MemRefType.get([shape[dim]], i64), [], []
+        )
+
     def sort_line(coordinates):
+        if use_merge:
+            _sort_merge_row(
+                output,
+                indices,
+                scratch,
+                scratch_indices,
+                coordinates,
+                dim,
+                shape[dim],
+                descending,
+                is_float,
+            )
+            return
         upper = arith.ConstantOp(index_type, max(shape[dim] - 1, 0)).result
         passes = scf.ForOp(zero, upper, one)
         with ir.InsertionPoint(passes.body):
